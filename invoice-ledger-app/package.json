@@ -1,0 +1,16 @@
+{
+  "name": "2mg-invoice-ledger",
+  "version": "1.0.0",
+  "description": "2MG Finance Pro Forma Invoice archive — create, edit, and export invoices to PDF, shared across the team.",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

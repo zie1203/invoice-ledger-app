@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "invoices": [
+    {
+      "id": "inv_seed_boon_pharma",
+      "invoiceNo": "202607_0001",
+      "invoiceDate": "2026-07-25",
+      "buyersOrderNo": "",
+      "buyersOrderDate": "",
+      "otherReference": "",
+      "billingAddress": "Unit 301 and 305, No. 17 Vatican Bldg,\nVatican City Drive, B.F. Resort Village,\nTalon Dos, Las Pinas City,\nMetro Manila, Philippines\nc/o Yash Parmar\ngetmedsindia@outlook.com\nph +91 81280 98273",
+      "consigneeName": "BOON PHARMA CORP",
+      "consigneeAddress": "UNIT 101, 1429 ANACLETO ST., ZONE 33, STA. CRUZ, BRGY. 334, MANILA CITY, METRO MANILA PHILIPPINES",
+      "buyerSameAsConsignee": true,
+      "buyerName": "",
+      "buyerAddress": "",
+      "countryOfFinalDestination": "Philippines",
+      "portOfDischarge": "Manila",
+      "shipmentMode": "",
+      "paymentTerms": "50% DOWNPAYMENT",
+      "countryOfOrigin": "INDIA",
+      "lineItems": [
+        {
+          "id": "li_seed_boon_1",
+          "type": "item",
+          "description": "FOLIC ACID",
+          "brandName": "FOLIN",
+          "hsnCode": "",
+          "quantity": 100000,
+          "rate": 0.73,
+          "manualAmount": null
+        }
+      ],
+      "amountInWordsOverride": null,
+      "bank": {
+        "bankName": "EASTWEST BANK",
+        "accountName": "2MG INCORPORATED",
+        "branchAddress": "10 Bf RESORT DR, BF RESORT VILLAGE, LAS PINAS CITY, Metro Manila, Philippines",
+        "accountNo": "200045284173"
+      },
+      "status": "sent",
+      "createdAt": 1753401600000,
+      "updatedAt": 1753401600000
+    },
+    {
+      "id": "inv_seed_central_west",
+      "invoiceNo": "202608_0001",
+      "invoiceDate": "2026-08-01",
+      "buyersOrderNo": "",
+      "buyersOrderDate": "",
+      "otherReference": "",
+      "billingAddress": "Unit 301 and 305, No. 17 Vatican Bldg,\nVatican City Drive, B.F. Resort Village,\nTalon Dos, Las Pinas City,\nMetro Manila, Philippines\nc/o Yash Parmar\ngetmedsindia@outlook.com\nph +91 81280 98273",
+      "consigneeName": "CENTRAL WEST MEDICALE INC.",
+      "consigneeAddress": "B1 L11 EASY ACCESS SUBD.\nUPPER PAKIGNE MINGLANILLA\nCEBU CITY\n6046",
+      "buyerSameAsConsignee": true,
+      "buyerName": "",
+      "buyerAddress": "",
+      "countryOfFinalDestination": "Philippines",
+      "portOfDischarge": "Manila",
+      "shipmentMode": "",
+      "paymentTerms": "35% DOWNPAYMENT",
+      "countryOfOrigin": "INDIA",
+      "lineItems": [
+        {
+          "id": "li_seed_cw_1",
+          "type": "item",
+          "description": "DEXMEDETOMIDINE VIAL",
+          "brandName": "DEXMECEN",
+          "hsnCode": "",
+          "quantity": 2500,
+          "rate": 320,
+          "manualAmount": null
+        },
+        {
+          "id": "li_seed_cw_2",
+          "type": "note",
+          "description": "DOWNPAYMENT 35%",
+          "manualAmount": 280000
+        }
+      ],
+      "amountInWordsOverride": null,
+      "bank": {
+        "bankName": "EASTWEST BANK",
+        "accountName": "2MG INCORPORATED",
+        "branchAddress": "10 Bf RESORT DR, BF RESORT VILLAGE, LAS PINAS CITY, Metro Manila, Philippines",
+        "accountNo": "200045284173"
+      },
+      "status": "sent",
+      "createdAt": 1754006400000,
+      "updatedAt": 1754006400000
+    }
+  ]
+}
