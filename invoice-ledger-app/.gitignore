@@ -1,4 +1,7 @@
 node_modules/
-data/state.json
-data/*.tmp
+data/
+.env
+.env.local
+server.js.pre-sqlite-backup
+server.js.pre-turso-backup
 .DS_Store

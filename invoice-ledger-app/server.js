@@ -1,8 +1,10 @@
 /**
- * 2MG Invoice Ledger — self-hosted server
+ * 2MG Invoice Ledger — self-hosted server (for local dev, or hosting this
+ * the traditional way on your own server/VPS instead of Vercel)
  *
- * Serves the static frontend (public/) and a tiny JSON-file-backed API that
- * holds the ONE shared invoice archive everyone in Finance reads and writes.
+ * Serves the static frontend (public/) and the same /api/state API that
+ * the Vercel deployment uses (api/state.js) — both share lib/db.js, so
+ * there's exactly one implementation of the storage/versioning logic.
  *
  *   GET  /api/state   -> { version, invoices }
  *   PUT  /api/state   -> body { version, invoices }
@@ -11,10 +13,8 @@
  *                          if someone else saved since your last GET —
  *                          adopt the returned version/invoices and retry.
  *
- * Storage is a single JSON file (data/state.json). Writes are serialized
- * in-process (writeQueue) so two overlapping PUTs never corrupt the file,
- * and each write goes to a temp file then renames over the original so a
- * crash mid-write can't leave a half-written file behind.
+ * Storage: Turso (hosted libSQL) if TURSO_DATABASE_URL is set, otherwise a
+ * local SQLite-compatible file at data/invoices.db — see lib/db.js.
  *
  * Run:
  *   npm install
@@ -23,57 +23,22 @@
  */
 
 const express = require("express");
-const fs = require("fs");
-const fsp = fs.promises;
 const path = require("path");
+const fs = require("fs");
+
+loadDotEnvIfPresent();
+
+const { readState, writeState } = require("./lib/db");
 
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, "data");
-const STATE_FILE = path.join(DATA_DIR, "state.json");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-// ---- storage helpers ----
-
-async function ensureStateFile(){
-  await fsp.mkdir(DATA_DIR, { recursive: true });
-  try {
-    await fsp.access(STATE_FILE);
-  } catch {
-    // First run: seed with the two real historical invoices from the
-    // original Excel template, so the archive isn't empty on day one.
-    const seed = require("./seed-state.json");
-    await writeStateFile(seed);
-  }
-}
-
-async function readStateFile(){
-  const raw = await fsp.readFile(STATE_FILE, "utf8");
-  return JSON.parse(raw);
-}
-
-async function writeStateFile(state){
-  const tmp = STATE_FILE + ".tmp";
-  await fsp.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
-  await fsp.rename(tmp, STATE_FILE);
-}
-
-// Serializes writes so concurrent PUTs can't interleave and corrupt the file.
-let writeQueue = Promise.resolve();
-function withWriteLock(fn){
-  const result = writeQueue.then(fn, fn);
-  // swallow errors here so one failed write doesn't wedge the queue forever
-  writeQueue = result.catch(() => {});
-  return result;
-}
-
-// ---- routes ----
-
 app.get("/api/state", async (req, res) => {
   try {
-    const state = await readStateFile();
+    const state = await readState();
     res.json(state);
   } catch (err) {
     console.error("GET /api/state failed:", err);
@@ -88,40 +53,40 @@ app.put("/api/state", async (req, res) => {
   }
 
   try {
-    const result = await withWriteLock(async () => {
-      const current = await readStateFile();
-      if (typeof version !== "number" || version !== current.version) {
-        // stale write — someone else saved first
-        return { conflict: true, current };
-      }
-      const next = { version: current.version + 1, invoices };
-      await writeStateFile(next);
-      return { conflict: false, next };
-    });
-
+    const result = await writeState(version, invoices);
     if (result.conflict) {
-      return res.status(409).json({
-        error: "conflict",
-        version: result.current.version,
-        invoices: result.current.invoices
-      });
+      return res.status(409).json({ error: "conflict", version: result.version, invoices: result.invoices });
     }
-    res.json(result.next);
+    res.json({ version: result.version, invoices: result.invoices });
   } catch (err) {
     console.error("PUT /api/state failed:", err);
     res.status(500).json({ error: "write_failed" });
   }
 });
 
-// ---- boot ----
+app.listen(PORT, () => {
+  console.log(`2MG Invoice Ledger running at http://localhost:${PORT}`);
+});
 
-ensureStateFile()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`2MG Invoice Ledger running at http://localhost:${PORT}`);
-    });
-  })
-  .catch((err) => {
-    console.error("Failed to initialize data/state.json:", err);
-    process.exit(1);
+// Tiny built-in .env loader (no dotenv dependency) so a local .env file with
+// TURSO_DATABASE_URL / TURSO_AUTH_TOKEN "just works" with `npm start`,
+// regardless of OS/shell — you don't need to know your terminal's
+// env-var syntax. Only used locally; Vercel sets its own env vars directly
+// and doesn't read this file at all.
+function loadDotEnvIfPresent() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, "utf8").split("\n");
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) return;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
   });
+}
