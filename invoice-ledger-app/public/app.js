@@ -84,6 +84,41 @@
   var FILTER_TEXT = "";
   var STATUS_FILTER = "all"; // "all" | "draft" | "sent" | "paid" — sidebar nav filter
 
+  // Session-only PDF attachments, keyed by invoice id:
+  //   invoiceId -> { name, size, pageCount, bytes: Uint8Array }
+  //
+  // Deliberately held here rather than on the invoice object or in the DOM:
+  //   - the invoice object is JSON.stringify'd by persist(), so bytes kept
+  //     here can never be serialized into the /api/state payload or uploaded;
+  //   - render() replaces appEl.innerHTML wholesale, which would discard a
+  //     File left sitting in the <input>, so the bytes are read immediately
+  //     on selection and held here instead.
+  //
+  // This is intentionally not persisted for v1: a refresh, tab close, or new
+  // session clears it, and the attachment UI says so.
+  var ATTACHMENTS = {};
+  var MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
+  var EXPORT_IN_FLIGHT = false;
+
+  // localStorage key for lightweight "this invoice had an attachment" markers.
+  // The stored value per invoice is a timestamp and nothing else — the invoice
+  // id is the map key.
+  //
+  // Deliberately NOT the original filename: a name like
+  // "Client_PO_signed.pdf" carries customer/commercial information, and it is
+  // not needed to display the warning. Never the PDF itself either: no bytes,
+  // no base64, no ArrayBuffer/Uint8Array/Blob, and nothing here is ever sent to
+  // the server or written to Turso.
+  //
+  // localStorage (not sessionStorage) so the warning survives closing the tab
+  // or the whole browser: the PDF bytes are gone for good at that point, and
+  // that is exactly when someone is most likely to assume they are still
+  // attached. The bytes themselves remain memory-only in ATTACHMENTS.
+  //
+  // v2: the key changed with the move off sessionStorage and the dropping of
+  // the filename, so no old-shape data is ever read back.
+  var ATTACHMENT_MARKER_KEY = "2mg.attachmentMarkers.v2";
+
   /* ============================== helpers ============================== */
 
   function uid(prefix) {
@@ -322,9 +357,35 @@
   function showConfirmModal(title, message, confirmLabel, onConfirm) {
     var el = ensureConfirmModal();
     el.querySelector("#confirm-modal-title").textContent = title;
-    el.querySelector("#confirm-modal-message").textContent = message;
+    var msgEl = el.querySelector("#confirm-modal-message");
+    msgEl.textContent = message;
+    // Blank lines in a message are meaningful for the attachment warnings;
+    // existing single-line callers are unaffected.
+    msgEl.style.whiteSpace = "pre-line";
     el.querySelector('[data-modal-action="confirm"]').textContent = confirmLabel || "Confirm";
+    // Restore the Cancel button in case showErrorModal() hid it last time —
+    // both share this one modal element.
+    var cancelBtn = el.querySelector('[data-modal-action="cancel"]');
+    if (cancelBtn) cancelBtn.style.display = "";
     el._onConfirm = onConfirm;
+    document.addEventListener("keydown", onConfirmModalKeydown);
+    requestAnimationFrame(function () { el.classList.add("show"); });
+  }
+
+  // Blocking error dialog, reusing the confirm modal's markup/styling with a
+  // single acknowledge button. Used instead of scheduleToast() for attachment
+  // and export failures: the toast auto-dismisses after 2.6s and always shows
+  // a check icon, which would read as success for a failed Finance export.
+  function showErrorModal(title, message) {
+    var el = ensureConfirmModal();
+    el.querySelector("#confirm-modal-title").textContent = title;
+    var msgEl = el.querySelector("#confirm-modal-message");
+    msgEl.textContent = message;
+    msgEl.style.whiteSpace = "pre-line";
+    var cancelBtn = el.querySelector('[data-modal-action="cancel"]');
+    if (cancelBtn) cancelBtn.style.display = "none";
+    el.querySelector('[data-modal-action="confirm"]').textContent = "OK";
+    el._onConfirm = null;
     document.addEventListener("keydown", onConfirmModalKeydown);
     requestAnimationFrame(function () { el.classList.add("show"); });
   }
@@ -362,6 +423,9 @@
         STATE = { invoices: Array.isArray(data.invoices) ? data.invoices : [] };
         STATE_VERSION = data.version || 0;
         LOADED = true;
+        // Markers persist across sessions now, so discard any left behind by
+        // invoices that no longer exist before anything renders.
+        pruneMarkers();
         hideConnBanner();
         render();
       })
@@ -534,6 +598,18 @@
         html += '<span class="meta-item">' + ICONS.calendar + ' ' + escapeHtml(formatDateLong(inv.invoiceDate)) + '</span>';
         if (inv.portOfDischarge) {
           html += '<span class="meta-item">&bull; ' + escapeHtml(inv.portOfDischarge) + '</span>';
+        }
+        // Export PDF can be triggered straight from this list, so surface the
+        // attachment state here too — including the "was attached, now gone"
+        // case, which is otherwise invisible after a refresh.
+        var attState = attachmentState(inv.id);
+        if (attState === "loaded") {
+          html += '<span class="meta-item" title="A PDF is attached for this session and will be appended on export">&bull; ' +
+            ICONS.pdf + ' PDF attached — session only</span>';
+        } else if (attState === "stale") {
+          html += '<span class="meta-item" style="color:var(--error);" ' +
+            'title="This invoice previously had a temporary PDF attachment, but the file is no longer loaded. Reattach the PDF before exporting if it should be included.">&bull; ' +
+            ICONS.pdf + ' PDF attachment not loaded</span>';
         }
         html += '</div>';
         html += '</div>';
@@ -714,6 +790,51 @@
     html += field("Account No. / IBAN", "bank.accountNo", inv.bank.accountNo, "text");
     html += '</div></div>';
 
+    // Attachment (session only)
+    var att = ATTACHMENTS[inv.id];
+    var hasStaleMarker = hasMarker(inv.id);
+    html += '<div class="card">';
+    html += '<div class="card-header"><h2>' + ICONS.pdf + ' Attach PDF</h2></div>';
+    if (att) {
+      html += '<div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">';
+      html += '<div style="min-width:0;">';
+      html += '<div style="font-size:13px; font-weight:600; color:var(--text); word-break:break-all;">' +
+        escapeHtml(att.name) + '</div>';
+      html += '<div class="hint" style="margin-top:2px;">' + formatBytes(att.size) + ' &middot; ' +
+        att.pageCount + ' page' + (att.pageCount === 1 ? '' : 's') +
+        ' &middot; appended after the invoice pages on export</div>';
+      html += '</div>';
+      html += '<button class="icon-btn danger" data-action="remove-attachment" title="Remove attachment" style="flex:none;">' +
+        ICONS.trash + ' Remove</button>';
+      html += '</div>';
+      html += '<div class="field" style="margin-top:12px;"><label>Replace with another PDF</label>' +
+        '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
+    } else if (hasStaleMarker) {
+      // Marker present but no bytes: the attachment was lost to a refresh, or
+      // to the tab/browser being closed. Warn rather than letting the user
+      // assume it is still here. The filename is deliberately not stored, so
+      // the wording does not name the file.
+      html += '<div style="background:var(--error-light); border:1px solid rgba(179, 49, 44, 0.25); ' +
+        'border-radius:var(--radius); padding:10px 12px; margin-bottom:12px;">';
+      html += '<div style="font-size:13px; font-weight:600; color:var(--error);">PDF attachment not loaded</div>';
+      html += '<div style="font-size:12px; color:var(--error); margin-top:3px; line-height:1.5;">' +
+        'This invoice previously had a temporary PDF attachment, but the file is no longer loaded. ' +
+        'Reattach the PDF before exporting if it should be included.</div>';
+      html += '</div>';
+      html += '<div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px;">';
+      html += '<div class="field" style="flex:1; min-width:0;"><label>Reattach PDF</label>' +
+        '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
+      html += '<button class="icon-btn danger" data-action="remove-attachment" title="Dismiss this warning" style="flex:none;">' +
+        ICONS.trash + ' Dismiss</button>';
+      html += '</div>';
+    } else {
+      html += '<div class="field"><label>PDF file</label>' +
+        '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
+    }
+    html += '<div class="hint" style="margin-top:8px;"><span class="highlight">Attached for this export session only. ' +
+      'This PDF is not saved with the invoice.</span></div>';
+    html += '</div>';
+
     html += '<div class="footer-actions">';
     html += '<button class="btn ghost-pdf" data-action="export-pdf" data-id="' + inv.id + '">' + ICONS.pdf + ' <span>Export PDF</span></button>';
     html += '<button class="btn primary" data-action="save-invoice">' + ICONS.save + ' <span>Save Invoice</span></button>';
@@ -818,6 +939,8 @@
         // always just be typed straight into those fields.
         inv2.updatedAt = Date.now();
         render();
+      } else if (t.matches('[data-action="attach-pdf"]')) {
+        handleAttachSelected(t);
       }
     };
 
@@ -863,15 +986,26 @@
       else if (action === "delete-invoice") {
         showConfirmModal("Delete this invoice?", "This cannot be undone.", "Delete", function () {
           STATE.invoices = STATE.invoices.filter(function (i) { return i.id !== id; });
+          delete ATTACHMENTS[id];
+          clearMarker(id);
           render();
           persist("Invoice deleted");
         });
       }
+      else if (action === "remove-attachment") {
+        // Also used as "Dismiss" on the stale-attachment warning, where there
+        // are no bytes to drop and only the marker needs clearing.
+        var invRA = currentInvoice();
+        if (invRA) {
+          delete ATTACHMENTS[invRA.id];
+          clearMarker(invRA.id);
+          render();
+        }
+      }
       else if (action === "save-invoice") {
-        var inv3 = currentInvoice();
-        if (inv3) inv3.updatedAt = Date.now();
-        render();
-        persist("Invoice saved successfully");
+        // Both Save Invoice buttons (editor topbar and editor footer) arrive
+        // here via this one action and hand off to the single save gate.
+        requestSave();
       }
       else if (action === "add-item-line") {
         var inv4 = currentInvoice();
@@ -913,15 +1047,373 @@
         render();
       }
       else if (action === "export-pdf") {
-        var inv7 = STATE.invoices.find(function (i) { return i.id === id; }) || currentInvoice();
-        if (inv7) exportPDF(inv7);
+        // Resolve the invoice, then hand off to the single shared gate. All
+        // three export entry points — editor topbar, editor footer, and the
+        // archive list — arrive here via this one action.
+        requestExport(STATE.invoices.find(function (i) { return i.id === id; }) || currentInvoice());
       }
     };
   }
 
+  /* ============================== session PDF attachment ============================== */
+
+  // ---- lightweight persistent markers (timestamp only, never PDF bytes) ----
+  //
+  // Every access is wrapped: localStorage throws in some privacy modes and when
+  // site data is blocked. On failure these degrade to "no markers", so the
+  // warnings quietly disappear and attaching/exporting still works.
+
+  function readMarkers() {
+    try {
+      var raw = window.localStorage.getItem(ATTACHMENT_MARKER_KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === "object") ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function writeMarkers(markers) {
+    try {
+      window.localStorage.setItem(ATTACHMENT_MARKER_KEY, JSON.stringify(markers));
+    } catch (e) { /* storage unavailable — warnings simply won't appear */ }
+  }
+
+  // Boolean by design: there is no filename to hand back, and returning only a
+  // flag makes it impossible to accidentally render stored data into the page.
+  function hasMarker(invoiceId) {
+    var m = readMarkers()[invoiceId];
+    return Boolean(m && typeof m === "object");
+  }
+
+  function setMarker(invoiceId) {
+    var markers = readMarkers();
+    markers[invoiceId] = { at: Date.now() };
+    writeMarkers(markers);
+  }
+
+  function clearMarker(invoiceId) {
+    var markers = readMarkers();
+    if (markers[invoiceId]) {
+      delete markers[invoiceId];
+      writeMarkers(markers);
+    }
+  }
+
+  // Markers now outlive the browser session, so without this they would
+  // accumulate forever. Drops any marker whose invoice no longer exists —
+  // deleted here, or by a teammate on another machine. Called once per load,
+  // right after STATE has been replaced by the server's copy.
+  function pruneMarkers() {
+    var markers = readMarkers();
+    var ids = Object.keys(markers);
+    if (!ids.length) return;
+    var live = {};
+    STATE.invoices.forEach(function (inv) { live[inv.id] = true; });
+    var changed = false;
+    ids.forEach(function (markerId) {
+      if (!live[markerId]) {
+        delete markers[markerId];
+        changed = true;
+      }
+    });
+    if (changed) writeMarkers(markers);
+  }
+
+  // Single source of truth for the three states, so the archive list, the
+  // editor card and the export gate can never disagree with each other:
+  //   "loaded" — bytes in memory, will be appended on export
+  //   "stale"  — a marker says a PDF was attached at some point, but the bytes
+  //              are gone (refresh, or the tab/browser was closed). Markers
+  //              outlive the session, so this survives a browser restart.
+  //   "none"   — nothing; the original, untouched export path
+  function attachmentState(invoiceId) {
+    if (ATTACHMENTS[invoiceId]) return "loaded";
+    if (hasMarker(invoiceId)) return "stale";
+    return "none";
+  }
+
+  // ---- the single export gate ----
+  //
+  // THE one place an export may begin. Every Export PDF button — editor
+  // topbar, editor footer, and the archive list — routes through the single
+  // "export-pdf" click action, which calls nothing but this function, so no
+  // entry point can reach exportPDF() without passing the three-state check.
+  //
+  // Do not call exportPDF() directly from a click handler or a new button:
+  // exportPDF() is the raw generator and performs no attachment checks at all.
+  // Its only legitimate callers are the branches below.
+  function requestExport(inv) {
+    if (!inv) return;
+    // Only ever true while an attachment merge is in flight, so the plain
+    // no-attachment export is unaffected by this guard.
+    if (EXPORT_IN_FLIGHT) return;
+
+    var state = attachmentState(inv.id);
+    if (state === "loaded") {
+      // Resolve the attachment ONCE, here, and carry that object all the way
+      // down to the merge. Nothing downstream reads ATTACHMENTS again, so the
+      // export cannot quietly degrade to invoice-only if the entry is removed
+      // between this decision and the merge.
+      var intended = ATTACHMENTS[inv.id];
+      // Confirmed on every export, by design: attachments are session-only and
+      // this is the moment the user needs reminding of that.
+      showConfirmModal(
+        "PDF attachment included",
+        "This export will include the attached PDF: " + intended.name + ".\n\n" +
+        "The attachment is temporary and is not saved with the invoice. " +
+        "After a page refresh or new session, you will need to reattach it.",
+        "Continue & export",
+        function () { exportPDF(inv, intended); }
+      );
+    } else if (state === "stale") {
+      // Never export silently here — the user may well believe the old
+      // attachment is still going to be included.
+      showConfirmModal(
+        "Attachment no longer available",
+        "This invoice previously had a temporary PDF attachment.\n\n" +
+        "The file is no longer loaded. Reattach it if it should be included, " +
+        "or export the invoice without it.",
+        "Export without attachment",
+        // Explicit null: the user has just consented to an invoice-only export.
+        function () { exportPDF(inv, null); }
+      );
+    } else {
+      // No attachment and no marker — unchanged behavior.
+      exportPDF(inv, null);
+    }
+  }
+
+  // ---- the single save gate ----
+  //
+  // Both Save Invoice buttons route through the one "save-invoice" action and
+  // land here. A *loaded* attachment warns that the PDF is not stored with the
+  // invoice; a stale marker alone does not, because the editor and archive
+  // warnings already cover that case.
+  function requestSave() {
+    var inv = currentInvoice();
+    if (inv && attachmentState(inv.id) === "loaded") {
+      showConfirmModal(
+        "PDF attachment is temporary",
+        "The invoice will be saved to the archive, but the attached PDF will not be stored with it. " +
+        "The PDF is available only for this browser session.",
+        "Save Invoice",
+        doSaveInvoice
+      );
+      return;
+    }
+    // No loaded attachment — exactly today's behavior, no extra confirmation.
+    doSaveInvoice();
+  }
+
+  // The original Save Invoice logic, unchanged. Note it deliberately does not
+  // touch ATTACHMENTS: saving keeps the in-memory PDF, so attach -> save ->
+  // archive -> reopen -> export combined still works for the rest of the
+  // session. Attachment data is never added to the invoice object here, so the
+  // /api/state payload is byte-for-byte what it would be without this feature.
+  function doSaveInvoice() {
+    var inv = currentInvoice();
+    if (inv) inv.updatedAt = Date.now();
+    render();
+    persist("Invoice saved successfully");
+  }
+
+  function formatBytes(n) {
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  // The browser's reported MIME type is unreliable (often empty or wrong on
+  // Windows), so accept either signal here and let the magic-byte check and
+  // the real pdf-lib parse below do the actual validation.
+  function looksLikePdf(file) {
+    return (file.type || "").toLowerCase() === "application/pdf" ||
+      /\.pdf$/i.test(file.name || "");
+  }
+
+  function readFileBytes(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+      reader.onerror = function () { reject(new Error("read_failed")); };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // The PDF spec allows the %PDF- header to sit anywhere in the first 1024
+  // bytes, so scan that window rather than testing only offset 0.
+  function hasPdfSignature(bytes) {
+    var limit = Math.min(bytes.length, 1024);
+    for (var i = 0; i + 4 < limit; i++) {
+      if (bytes[i] === 0x25 && bytes[i + 1] === 0x50 && bytes[i + 2] === 0x44 &&
+        bytes[i + 3] === 0x46 && bytes[i + 4] === 0x2D) return true;
+    }
+    return false;
+  }
+
+  function describeAttachError(err, filename) {
+    var msg = String((err && err.message) || err || "");
+    if ((err && err.name === "EncryptedPDFError") || msg.toLowerCase().indexOf("encrypted") > -1) {
+      return '"' + filename + '" is password-protected or encrypted. Please remove the protection, or attach an unprotected copy.';
+    }
+    if (msg === "not_pdf") return '"' + filename + '" is not a valid PDF file.';
+    if (msg === "no_pages") return '"' + filename + '" contains no pages.';
+    if (msg === "read_failed") return '"' + filename + '" could not be read from disk. Please try again.';
+    return '"' + filename + '" could not be read as a PDF. The file may be corrupt.';
+  }
+
+  // Validates the picked file and, only once it has genuinely parsed as a PDF,
+  // stores its bytes in ATTACHMENTS. Validating here (rather than at export
+  // time) means a bad file is caught while the user is still preparing the
+  // invoice, not when they are trying to send it.
+  function handleAttachSelected(input) {
+    var inv = currentInvoice();
+    var file = input.files && input.files[0];
+    // Clear the input so picking the same file again still fires a change
+    // event after an error, and so no File is left referenced by the DOM.
+    input.value = "";
+    if (!inv || !file) return;
+
+    if (!window.PDFLib || !window.PDFLib.PDFDocument) {
+      showErrorModal("PDF engine unavailable",
+        "The PDF library needed to read attachments did not load. Check your connection, reload the page, and try again.");
+      return;
+    }
+    if (!looksLikePdf(file)) {
+      showErrorModal("Not a PDF", '"' + file.name + '" is not a PDF file. Please attach a .pdf file.');
+      return;
+    }
+    if (file.size === 0) {
+      showErrorModal("Empty file", '"' + file.name + '" is empty.');
+      return;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      showErrorModal("File too large",
+        '"' + file.name + '" is ' + formatBytes(file.size) + '. The maximum attachment size is ' +
+        formatBytes(MAX_ATTACHMENT_BYTES) + '.');
+      return;
+    }
+
+    readFileBytes(file)
+      .then(function (bytes) {
+        if (!hasPdfSignature(bytes)) throw new Error("not_pdf");
+        // Parse a copy, so the stored bytes stay pristine for export.
+        return window.PDFLib.PDFDocument.load(bytes.slice(0)).then(function (parsed) {
+          var pageCount = parsed.getPageCount();
+          if (!pageCount) throw new Error("no_pages");
+          ATTACHMENTS[inv.id] = {
+            name: file.name,
+            size: file.size,
+            pageCount: pageCount,
+            bytes: bytes
+          };
+          // Timestamp-only marker, so a later refresh or reopen can still warn
+          // that this invoice had an attachment. No filename, no bytes.
+          // Reattaching refreshes the existing marker.
+          setMarker(inv.id);
+        });
+      })
+      .then(function () {
+        render();
+        scheduleToast("PDF attached for this session");
+      })
+      .catch(function (err) {
+        showErrorModal("Could not attach this PDF", describeAttachError(err, file.name));
+      });
+  }
+
+  function downloadBytes(bytes, filename) {
+    var blob = new Blob([bytes], { type: "application/pdf" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  // Final step of exportPDF(). `att` is the export intent, resolved once by
+  // requestExport() and handed down explicitly:
+  //   null        -> invoice-only export; the original doc.save() path
+  //   attachment  -> this exact PDF must be merged in, or the export stops
+  //
+  // Finance safety rule: this must never quietly hand someone an invoice that
+  // is missing the PDF they expected. That is precisely why this function does
+  // NOT consult ATTACHMENTS. If it re-derived the decision here, any future
+  // async step between the gate and this point could let the entry disappear
+  // and silently downgrade the export to invoice-only.
+  function finishExport(doc, filename, att) {
+    if (att === undefined) {
+      // A caller failed to state its intent. Fail loudly rather than guess —
+      // guessing is the silent downgrade this signature exists to prevent.
+      showErrorModal("Export stopped",
+        "The export could not determine whether a PDF attachment should be included. " +
+        "Nothing has been downloaded. Please try again from the Export PDF button.");
+      return;
+    }
+    if (att === null) {
+      doc.save(filename);
+      return;
+    }
+
+    if (!window.PDFLib || !window.PDFLib.PDFDocument) {
+      showErrorModal("Export stopped — PDF engine unavailable",
+        "This invoice has an attached PDF, but the library needed to merge it did not load. " +
+        "Nothing has been downloaded. Check your connection, reload the page, and try again.");
+      return;
+    }
+
+    var invoiceBytes;
+    try {
+      invoiceBytes = doc.output("arraybuffer");
+    } catch (e) {
+      showErrorModal("Export stopped",
+        "The invoice PDF could not be prepared for merging. Nothing has been downloaded.");
+      return;
+    }
+
+    EXPORT_IN_FLIGHT = true;
+    var PDFDocument = window.PDFLib.PDFDocument;
+    // slice(0) hands pdf-lib its own copy, so the stored attachment stays
+    // reusable and exporting the same invoice twice in a row still works.
+    Promise.all([PDFDocument.load(invoiceBytes), PDFDocument.load(att.bytes.slice(0))])
+      .then(function (docs) {
+        var merged = docs[0];
+        var donor = docs[1];
+        // Every attachment page, in order, appended after the invoice pages.
+        // Pages are copied verbatim — never stamped or otherwise modified, so
+        // the existing "Page X of Y" footer stays on the generated pages only.
+        return merged.copyPages(donor, donor.getPageIndices()).then(function (pages) {
+          pages.forEach(function (page) { merged.addPage(page); });
+          return merged.save();
+        });
+      })
+      .then(function (mergedBytes) {
+        downloadBytes(mergedBytes, filename);
+        EXPORT_IN_FLIGHT = false;
+        scheduleToast("Exported with attachment (" + att.pageCount + " extra page" +
+          (att.pageCount === 1 ? "" : "s") + ")");
+      })
+      .catch(function () {
+        EXPORT_IN_FLIGHT = false;
+        showErrorModal("Export stopped — attachment could not be merged",
+          '"' + att.name + '" could not be merged into this invoice. Nothing has been downloaded, ' +
+          "so you will not send an invoice that is missing its attachment. " +
+          "Try removing the attachment and adding it again.");
+      });
+  }
+
   /* ============================== Pixel-Perfect Aligned PDF Engine ============================== */
 
-  function exportPDF(inv) {
+  // `attachment` is the export intent resolved by requestExport(): either the
+  // attachment object that must be merged in, or an explicit null for an
+  // invoice-only export. It is passed straight through to finishExport() and
+  // is never re-derived here.
+  function exportPDF(inv, attachment) {
     if (!window.jspdf || !window.jspdf.jsPDF) {
       scheduleToast("PDF engine failed to load — check your connection and try again");
       return;
@@ -1389,7 +1881,7 @@
     }
 
     var filename = "ProForma_" + (inv.invoiceNo || "Invoice") + "_" + (inv.consigneeName || "Client").replace(/[^a-z0-9]+/gi, "_") + ".pdf";
-    doc.save(filename);
+    finishExport(doc, filename, attachment);
   }
 
   /* ============================== boot ============================== */
