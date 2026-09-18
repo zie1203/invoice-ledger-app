@@ -1,5 +1,6 @@
 node_modules/
 data/
+data-dev/
 .env
 .env.local
 server.js.pre-sqlite-backup

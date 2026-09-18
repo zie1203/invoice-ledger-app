@@ -84,40 +84,31 @@
   var FILTER_TEXT = "";
   var STATUS_FILTER = "all"; // "all" | "draft" | "sent" | "paid" — sidebar nav filter
 
-  // Session-only PDF attachments, keyed by invoice id:
+  // PENDING (not yet uploaded) PDF attachments, keyed by invoice id:
   //   invoiceId -> { name, size, pageCount, bytes: Uint8Array }
   //
-  // Deliberately held here rather than on the invoice object or in the DOM:
-  //   - the invoice object is JSON.stringify'd by persist(), so bytes kept
-  //     here can never be serialized into the /api/state payload or uploaded;
-  //   - render() replaces appEl.innerHTML wholesale, which would discard a
-  //     File left sitting in the <input>, so the bytes are read immediately
-  //     on selection and held here instead.
+  // This holds a PDF the user has just picked but has NOT saved yet. It is
+  // browser memory only and is deliberately NOT on the invoice object, because
+  // the invoice is JSON.stringify'd by persist() — bytes kept here can never
+  // reach the /api/state payload. render() also replaces appEl.innerHTML
+  // wholesale, which would discard a File left in the <input>, so the bytes are
+  // read immediately on selection and held here.
   //
-  // This is intentionally not persisted for v1: a refresh, tab close, or new
-  // session clears it, and the attachment UI says so.
+  // Once the invoice is saved the bytes are uploaded (encrypted server-side),
+  // the entry here is dropped, and the attachment lives on as metadata in
+  // inv.attachment — see attachmentState().
   var ATTACHMENTS = {};
-  var MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
+
+  // Matches the server's authoritative limit exactly. The server re-checks this
+  // and is the real gate; this only avoids offering an upload that must fail.
+  var MAX_ATTACHMENT_BYTES = 4000000;
   var EXPORT_IN_FLIGHT = false;
 
-  // localStorage key for lightweight "this invoice had an attachment" markers.
-  // The stored value per invoice is a timestamp and nothing else — the invoice
-  // id is the map key.
-  //
-  // Deliberately NOT the original filename: a name like
-  // "Client_PO_signed.pdf" carries customer/commercial information, and it is
-  // not needed to display the warning. Never the PDF itself either: no bytes,
-  // no base64, no ArrayBuffer/Uint8Array/Blob, and nothing here is ever sent to
-  // the server or written to Turso.
-  //
-  // localStorage (not sessionStorage) so the warning survives closing the tab
-  // or the whole browser: the PDF bytes are gone for good at that point, and
-  // that is exactly when someone is most likely to assume they are still
-  // attached. The bytes themselves remain memory-only in ATTACHMENTS.
-  //
-  // v2: the key changed with the move off sessionStorage and the dropping of
-  // the filename, so no old-shape data is ever read back.
-  var ATTACHMENT_MARKER_KEY = "2mg.attachmentMarkers.v2";
+  // Obsolete key from the session-only design. Attachments are now persisted
+  // server-side, so the "this invoice used to have an attachment" marker is
+  // meaningless — and would contradict the real stored state. Cleared once on
+  // boot so no stale value lingers in anyone's browser.
+  var LEGACY_MARKER_KEY = "2mg.attachmentMarkers.v2";
 
   /* ============================== helpers ============================== */
 
@@ -413,19 +404,97 @@
     if (el) el.remove();
   }
 
+  /* ============================== session ============================== */
+
+  // The passphrase is never stored by the client — not in a variable that
+  // outlives the request, not in localStorage, not in a cookie we can read.
+  // The server sets an HttpOnly cookie that this code cannot access at all;
+  // authentication state is inferred purely from whether /api/* returns 401.
+  function renderLogin(errorMsg) {
+    VIEW = { name: "login", invoiceId: null };
+    LOADED = false;
+    hideConnBanner();
+    appEl.innerHTML =
+      '<div style="min-height:100vh; width:100%; display:flex; align-items:center; justify-content:center; padding:16px;">' +
+        '<div class="card" style="max-width:360px; width:100%; margin:0;">' +
+          '<div class="card-header"><h2>' + ICONS.fileText + ' 2MG Invoice Ledger</h2></div>' +
+          '<div class="hint" style="margin-bottom:14px;">Enter the shared Finance passphrase to continue.</div>' +
+          '<div class="field"><label for="login-pass">Passphrase</label>' +
+            '<input type="password" id="login-pass" autocomplete="current-password"></div>' +
+          (errorMsg
+            ? '<div class="hint" style="color:var(--error); margin-top:8px;">' + escapeHtml(errorMsg) + '</div>'
+            : '') +
+          '<div style="margin-top:14px; display:flex; justify-content:flex-end;">' +
+            '<button class="btn primary" id="login-submit">' + ICONS.check + ' <span>Sign in</span></button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    var input = document.getElementById("login-pass");
+    var btn = document.getElementById("login-submit");
+    if (btn) btn.onclick = submitLogin;
+    if (input) {
+      input.onkeydown = function (e) { if (e.key === "Enter") submitLogin(); };
+      input.focus();
+    }
+  }
+
+  function submitLogin() {
+    var input = document.getElementById("login-pass");
+    var btn = document.getElementById("login-submit");
+    if (!input) return;
+    var passphrase = input.value;
+    if (!passphrase) { renderLogin("Please enter the passphrase."); return; }
+    if (btn) btn.disabled = true;
+
+    fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: passphrase })
+    })
+      .then(function (res) {
+        // Drop the passphrase as soon as it has been sent. It is never
+        // persisted anywhere on the client.
+        passphrase = null;
+        input.value = "";
+        if (res.ok) {
+          VIEW = { name: "archive", invoiceId: null };
+          loadState();
+          return;
+        }
+        if (res.status === 503) {
+          renderLogin("Server authentication is not configured. Contact whoever set up the server.");
+          return;
+        }
+        renderLogin("Incorrect passphrase.");
+      })
+      .catch(function () {
+        passphrase = null;
+        renderLogin("Can't reach the server. Please try again.");
+      });
+  }
+
+  function logout() {
+    // Session-only attachment bytes must not outlive the session on a shared
+    // machine. Markers (timestamps only) are left alone.
+    ATTACHMENTS = {};
+    fetch("/api/auth", { method: "DELETE" })
+      .then(function () { renderLogin(); })
+      .catch(function () { renderLogin(); });
+  }
+
   function loadState() {
     return fetch("/api/state")
       .then(function (res) {
+        if (res.status === 401) { renderLogin(); return null; }
         if (!res.ok) throw new Error("HTTP " + res.status);
         return res.json();
       })
       .then(function (data) {
+        if (!data) return; // 401 — the login view is already showing
         STATE = { invoices: Array.isArray(data.invoices) ? data.invoices : [] };
         STATE_VERSION = data.version || 0;
         LOADED = true;
-        // Markers persist across sessions now, so discard any left behind by
-        // invoices that no longer exist before anything renders.
-        pruneMarkers();
+        clearLegacyMarkers();
         hideConnBanner();
         render();
       })
@@ -435,21 +504,39 @@
       });
   }
 
-  function persist(successMsg) {
-    if (!LOADED) return;
-    SAVING = true;
-    fetch("/api/state", {
+  // One save attempt, as a promise. Used directly by the attachment flows,
+  // which need to know whether the save actually landed before they touch a
+  // Sanity asset. persist() wraps this with the existing retry/409/401 handling.
+  function persistRequest() {
+    return fetch("/api/state", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ version: STATE_VERSION, invoices: STATE.invoices })
-    })
-      .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, status: res.status, body: body }; }); })
+    }).then(function (res) {
+      return res.json().then(function (body) {
+        return { ok: res.ok, status: res.status, body: body };
+      });
+    });
+  }
+
+  // `onSaved` runs only after the invoice state is genuinely persisted. Asset
+  // deletions hang off it, so a Sanity blob is never removed before the invoice
+  // that stopped referencing it is safely saved.
+  function persist(successMsg, onSaved) {
+    if (!LOADED) return;
+    SAVING = true;
+    persistRequest()
       .then(function (result) {
         SAVING = false;
         if (result.ok) {
           STATE_VERSION = result.body.version;
           hideConnBanner();
           if (successMsg) scheduleToast(successMsg);
+          if (typeof onSaved === "function") onSaved();
+        } else if (result.status === 401) {
+          // Session expired or signed out elsewhere. Stop the retry loop and
+          // ask for the passphrase again rather than looping on 401 forever.
+          renderLogin("Your session expired. Please sign in again.");
         } else if (result.status === 409) {
           STATE = { invoices: result.body.invoices || [] };
           STATE_VERSION = result.body.version;
@@ -470,6 +557,7 @@
   function pollForUpdates() {
     if (VIEW.name === "archive" && LOADED && !SAVING) {
       fetch("/api/state").then(function (res) {
+        if (res.status === 401) { renderLogin("Your session expired. Please sign in again."); return; }
         if (!res.ok) return;
         return res.json();
       }).then(function (data) {
@@ -489,6 +577,9 @@
   var appEl = document.getElementById("app");
 
   function render() {
+    // The login view owns the DOM while it is up; nothing else may paint over
+    // it (a late poll response, for instance).
+    if (VIEW.name === "login") return;
     if (VIEW.name === "editor") {
       appEl.innerHTML = renderShell(renderEditor());
     } else {
@@ -533,6 +624,9 @@
       '<div class="sidebar-foot">' +
       '2MG Incorporated<br>' +
       'Finance &middot; Pro Forma Invoices' +
+      '<div style="margin-top:10px;">' +
+      '<button class="btn ghost" data-action="logout" style="width:100%; padding:5px 8px; font-size:12px;">Sign out</button>' +
+      '</div>' +
       '</div>' +
       '</div>' +
       '<div class="main">' + mainHtml + '</div>'
@@ -600,16 +694,15 @@
           html += '<span class="meta-item">&bull; ' + escapeHtml(inv.portOfDischarge) + '</span>';
         }
         // Export PDF can be triggered straight from this list, so surface the
-        // attachment state here too — including the "was attached, now gone"
-        // case, which is otherwise invisible after a refresh.
-        var attState = attachmentState(inv.id);
-        if (attState === "loaded") {
-          html += '<span class="meta-item" title="A PDF is attached for this session and will be appended on export">&bull; ' +
-            ICONS.pdf + ' PDF attached — session only</span>';
-        } else if (attState === "stale") {
+        // attachment state here too.
+        var attState = attachmentState(inv);
+        if (attState === "stored") {
+          html += '<span class="meta-item" title="An encrypted PDF is stored with this invoice and is appended on export">&bull; ' +
+            ICONS.pdf + ' PDF attached &middot; stored</span>';
+        } else if (attState === "local") {
           html += '<span class="meta-item" style="color:var(--error);" ' +
-            'title="This invoice previously had a temporary PDF attachment, but the file is no longer loaded. Reattach the PDF before exporting if it should be included.">&bull; ' +
-            ICONS.pdf + ' PDF attachment not loaded</span>';
+            'title="A PDF is selected but not saved yet. Save the invoice to store it permanently.">&bull; ' +
+            ICONS.pdf + ' PDF selected &middot; not saved</span>';
         }
         html += '</div>';
         html += '</div>';
@@ -790,49 +883,55 @@
     html += field("Account No. / IBAN", "bank.accountNo", inv.bank.accountNo, "text");
     html += '</div></div>';
 
-    // Attachment (session only)
-    var att = ATTACHMENTS[inv.id];
-    var hasStaleMarker = hasMarker(inv.id);
+    // Attachment
+    var pendingAtt = ATTACHMENTS[inv.id];
+    var storedAtt = (inv.attachment && inv.attachment.assetId) ? inv.attachment : null;
     html += '<div class="card">';
     html += '<div class="card-header"><h2>' + ICONS.pdf + ' Attach PDF</h2></div>';
-    if (att) {
+    if (pendingAtt) {
+      // Picked but not uploaded yet. The filename is shown only here, from
+      // browser memory, so the user can confirm they picked the right file; it
+      // is never sent to the server, stored, or shown for a stored attachment.
       html += '<div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">';
       html += '<div style="min-width:0;">';
       html += '<div style="font-size:13px; font-weight:600; color:var(--text); word-break:break-all;">' +
-        escapeHtml(att.name) + '</div>';
-      html += '<div class="hint" style="margin-top:2px;">' + formatBytes(att.size) + ' &middot; ' +
-        att.pageCount + ' page' + (att.pageCount === 1 ? '' : 's') +
+        escapeHtml(pendingAtt.name) + '</div>';
+      html += '<div class="hint" style="margin-top:2px; color:var(--error);">' + formatBytes(pendingAtt.size) + ' &middot; ' +
+        pendingAtt.pageCount + ' page' + (pendingAtt.pageCount === 1 ? '' : 's') +
+        ' &middot; not saved yet — Save Invoice to store it</div>';
+      html += '</div>';
+      html += '<button class="icon-btn danger" data-action="remove-attachment" title="Discard this selection" style="flex:none;">' +
+        ICONS.trash + ' Discard</button>';
+      html += '</div>';
+      html += '<div class="field" style="margin-top:12px;"><label>Choose a different PDF</label>' +
+        '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
+    } else if (storedAtt) {
+      html += '<div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">';
+      html += '<div style="min-width:0;">';
+      // No icon here on purpose: the ICONS SVGs carry a viewBox but no
+      // width/height, and CSS only sizes them inside specific containers
+      // (.btn svg, .icon-btn svg, .card-header h2 svg, .toast svg). In a bare
+      // div the glyph stretches to fill the card.
+      html += '<div style="font-size:13px; font-weight:600; color:var(--text);">' +
+        'PDF attached &middot; stored</div>';
+      html += '<div class="hint" style="margin-top:2px;">' +
+        (storedAtt.pageCount || 0) + ' page' + (storedAtt.pageCount === 1 ? '' : 's') +
+        ' &middot; ' + formatBytes(storedAtt.byteSize || 0) +
         ' &middot; appended after the invoice pages on export</div>';
       html += '</div>';
-      html += '<button class="icon-btn danger" data-action="remove-attachment" title="Remove attachment" style="flex:none;">' +
+      html += '<button class="icon-btn danger" data-action="remove-attachment" title="Permanently remove the stored PDF" style="flex:none;">' +
         ICONS.trash + ' Remove</button>';
       html += '</div>';
       html += '<div class="field" style="margin-top:12px;"><label>Replace with another PDF</label>' +
         '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
-    } else if (hasStaleMarker) {
-      // Marker present but no bytes: the attachment was lost to a refresh, or
-      // to the tab/browser being closed. Warn rather than letting the user
-      // assume it is still here. The filename is deliberately not stored, so
-      // the wording does not name the file.
-      html += '<div style="background:var(--error-light); border:1px solid rgba(179, 49, 44, 0.25); ' +
-        'border-radius:var(--radius); padding:10px 12px; margin-bottom:12px;">';
-      html += '<div style="font-size:13px; font-weight:600; color:var(--error);">PDF attachment not loaded</div>';
-      html += '<div style="font-size:12px; color:var(--error); margin-top:3px; line-height:1.5;">' +
-        'This invoice previously had a temporary PDF attachment, but the file is no longer loaded. ' +
-        'Reattach the PDF before exporting if it should be included.</div>';
-      html += '</div>';
-      html += '<div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px;">';
-      html += '<div class="field" style="flex:1; min-width:0;"><label>Reattach PDF</label>' +
-        '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
-      html += '<button class="icon-btn danger" data-action="remove-attachment" title="Dismiss this warning" style="flex:none;">' +
-        ICONS.trash + ' Dismiss</button>';
-      html += '</div>';
     } else {
       html += '<div class="field"><label>PDF file</label>' +
         '<input type="file" accept="application/pdf,.pdf" data-action="attach-pdf"></div>';
     }
-    html += '<div class="hint" style="margin-top:8px;"><span class="highlight">Attached for this export session only. ' +
-      'This PDF is not saved with the invoice.</span></div>';
+    if (!storedAtt || pendingAtt) {
+      html += '<div class="hint" style="margin-top:8px;">The PDF is encrypted and stored with the invoice when you save. ' +
+        'It stays available on any device.</div>';
+    }
     html += '</div>';
 
     html += '<div class="footer-actions">';
@@ -890,8 +989,20 @@
         var amt = lineAmount(item);
         var amtCell = row.querySelector(".amt-cell");
         if (amtCell) amtCell.textContent = formatMoney(amt);
+        // One canonical total — the same invoiceTotal() the totals card, the
+        // words field and the PDF export all use — so the number and its
+        // wording can never drift apart.
+        var newTotal = invoiceTotal(inv2);
         var totalEl = document.querySelector(".totals-card .amount");
-        if (totalEl) totalEl.textContent = "PHP " + formatMoney(invoiceTotal(inv2));
+        if (totalEl) totalEl.textContent = "PHP " + formatMoney(newTotal);
+        // Amount Chargeable is derived from the total, so it has to move with
+        // it. Previously it was only recomputed by renderEditor(), which is why
+        // it appeared to refresh only after an unrelated Add Item click. A
+        // manual override still wins, matching renderEditor()'s own condition.
+        var wordsEl = document.querySelector('[data-field="amountInWordsOverride"]');
+        if (wordsEl && (inv2.amountInWordsOverride === null || inv2.amountInWordsOverride === undefined)) {
+          wordsEl.value = amountInWordsPHP(newTotal);
+        }
       } else if (t.matches("[data-li-extra]")) {
         var row2 = t.closest("[data-li]");
         var liId2 = row2.getAttribute("data-li");
@@ -978,34 +1089,60 @@
           copy.createdAt = Date.now();
           copy.updatedAt = Date.now();
           copy.lineItems.forEach(function (li) { li.id = uid("li"); });
+          // A duplicate starts with no attachment: the deep copy would
+          // otherwise carry the source invoice's assetId, leaving two invoices
+          // pointing at one blob so that removing either would break the other.
+          delete copy.attachment;
           STATE.invoices.push(copy);
           render();
           persist("Invoice duplicated");
         }
       }
       else if (action === "delete-invoice") {
+        var invDel = STATE.invoices.find(function (i) { return i.id === id; });
+        var orphanedAsset = (invDel && invDel.attachment) ? invDel.attachment.assetId : null;
         showConfirmModal("Delete this invoice?", "This cannot be undone.", "Delete", function () {
           STATE.invoices = STATE.invoices.filter(function (i) { return i.id !== id; });
           delete ATTACHMENTS[id];
-          clearMarker(id);
           render();
-          persist("Invoice deleted");
+          // Save the removal FIRST; the blob is only deleted once no invoice
+          // references it any more.
+          persist("Invoice deleted", function () { deleteStoredAsset(orphanedAsset); });
         });
       }
       else if (action === "remove-attachment") {
-        // Also used as "Dismiss" on the stale-attachment warning, where there
-        // are no bytes to drop and only the marker needs clearing.
         var invRA = currentInvoice();
         if (invRA) {
-          delete ATTACHMENTS[invRA.id];
-          clearMarker(invRA.id);
-          render();
+          if (ATTACHMENTS[invRA.id]) {
+            // Only discarding the pending selection — nothing stored is touched.
+            delete ATTACHMENTS[invRA.id];
+            render();
+            scheduleToast("Selection discarded");
+          } else if (invRA.attachment && invRA.attachment.assetId) {
+            var removedAsset = invRA.attachment.assetId;
+            showConfirmModal(
+              "Remove the stored PDF?",
+              "The attached PDF will be permanently deleted from secure storage and will no longer be " +
+              "included when this invoice is exported.\n\nThis cannot be undone.",
+              "Remove PDF",
+              function () {
+                delete invRA.attachment;
+                invRA.updatedAt = Date.now();
+                render();
+                // Metadata removal is saved first; the blob goes only after.
+                persist("Attachment removed", function () { deleteStoredAsset(removedAsset); });
+              }
+            );
+          }
         }
       }
       else if (action === "save-invoice") {
         // Both Save Invoice buttons (editor topbar and editor footer) arrive
         // here via this one action and hand off to the single save gate.
         requestSave();
+      }
+      else if (action === "logout") {
+        logout();
       }
       else if (action === "add-item-line") {
         var inv4 = currentInvoice();
@@ -1057,81 +1194,63 @@
 
   /* ============================== session PDF attachment ============================== */
 
-  // ---- lightweight persistent markers (timestamp only, never PDF bytes) ----
-  //
-  // Every access is wrapped: localStorage throws in some privacy modes and when
-  // site data is blocked. On failure these degrade to "no markers", so the
-  // warnings quietly disappear and attaching/exporting still works.
-
-  function readMarkers() {
+  // One-time removal of the obsolete session-marker key. Attachments are now
+  // persisted server-side, so browser-local state is never the source of truth.
+  function clearLegacyMarkers() {
     try {
-      var raw = window.localStorage.getItem(ATTACHMENT_MARKER_KEY);
-      if (!raw) return {};
-      var parsed = JSON.parse(raw);
-      return (parsed && typeof parsed === "object") ? parsed : {};
-    } catch (e) {
-      return {};
-    }
-  }
-
-  function writeMarkers(markers) {
-    try {
-      window.localStorage.setItem(ATTACHMENT_MARKER_KEY, JSON.stringify(markers));
-    } catch (e) { /* storage unavailable — warnings simply won't appear */ }
-  }
-
-  // Boolean by design: there is no filename to hand back, and returning only a
-  // flag makes it impossible to accidentally render stored data into the page.
-  function hasMarker(invoiceId) {
-    var m = readMarkers()[invoiceId];
-    return Boolean(m && typeof m === "object");
-  }
-
-  function setMarker(invoiceId) {
-    var markers = readMarkers();
-    markers[invoiceId] = { at: Date.now() };
-    writeMarkers(markers);
-  }
-
-  function clearMarker(invoiceId) {
-    var markers = readMarkers();
-    if (markers[invoiceId]) {
-      delete markers[invoiceId];
-      writeMarkers(markers);
-    }
-  }
-
-  // Markers now outlive the browser session, so without this they would
-  // accumulate forever. Drops any marker whose invoice no longer exists —
-  // deleted here, or by a teammate on another machine. Called once per load,
-  // right after STATE has been replaced by the server's copy.
-  function pruneMarkers() {
-    var markers = readMarkers();
-    var ids = Object.keys(markers);
-    if (!ids.length) return;
-    var live = {};
-    STATE.invoices.forEach(function (inv) { live[inv.id] = true; });
-    var changed = false;
-    ids.forEach(function (markerId) {
-      if (!live[markerId]) {
-        delete markers[markerId];
-        changed = true;
-      }
-    });
-    if (changed) writeMarkers(markers);
+      window.localStorage.removeItem(LEGACY_MARKER_KEY);
+    } catch (e) { /* storage unavailable — nothing to clean up */ }
   }
 
   // Single source of truth for the three states, so the archive list, the
-  // editor card and the export gate can never disagree with each other:
-  //   "loaded" — bytes in memory, will be appended on export
-  //   "stale"  — a marker says a PDF was attached at some point, but the bytes
-  //              are gone (refresh, or the tab/browser was closed). Markers
-  //              outlive the session, so this survives a browser restart.
+  // editor card, the save gate and the export gate can never disagree:
+  //   "local"  — bytes sitting in browser memory, picked but not saved yet
+  //   "stored" — invoice metadata points at an encrypted PDF held in Sanity
   //   "none"   — nothing; the original, untouched export path
-  function attachmentState(invoiceId) {
-    if (ATTACHMENTS[invoiceId]) return "loaded";
-    if (hasMarker(invoiceId)) return "stale";
+  //
+  // "local" wins when both are true: that is a pending REPLACEMENT, and the new
+  // file is what the user is looking at and expects to act on.
+  function attachmentState(inv) {
+    if (!inv) return "none";
+    if (ATTACHMENTS[inv.id]) return "local";
+    if (inv.attachment && inv.attachment.assetId) return "stored";
     return "none";
+  }
+
+  /* ---------------------- attachment server operations ---------------------- */
+
+  // Uploads the pending bytes. The server validates authoritatively, encrypts,
+  // and stores ciphertext only; it returns metadata with no filename and no
+  // key material.
+  function uploadPendingAttachment(inv, pending) {
+    return fetch("/api/attachments?invoiceId=" + encodeURIComponent(inv.id), {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: pending.bytes
+    }).then(function (res) {
+      if (res.status === 401) {
+        var unauth = new Error("unauthorized");
+        unauth.unauthorized = true;
+        throw unauth;
+      }
+      return res.json().then(function (body) {
+        if (!res.ok) {
+          var err = new Error((body && body.message) || "upload failed");
+          err.serverCode = body && body.error;
+          throw err;
+        }
+        return body;
+      });
+    });
+  }
+
+  // Best-effort cleanup. An orphaned blob is harmless; a dangling invoice
+  // reference is not — so this never blocks the user and never rolls anything
+  // back on failure.
+  function deleteStoredAsset(assetId) {
+    if (!assetId) return Promise.resolve();
+    return fetch("/api/attachments?assetId=" + encodeURIComponent(assetId), { method: "DELETE" })
+      .catch(function () { /* orphan tolerated and logged server-side */ });
   }
 
   // ---- the single export gate ----
@@ -1150,68 +1269,181 @@
     // no-attachment export is unaffected by this guard.
     if (EXPORT_IN_FLIGHT) return;
 
-    var state = attachmentState(inv.id);
-    if (state === "loaded") {
-      // Resolve the attachment ONCE, here, and carry that object all the way
-      // down to the merge. Nothing downstream reads ATTACHMENTS again, so the
-      // export cannot quietly degrade to invoice-only if the entry is removed
-      // between this decision and the merge.
-      var intended = ATTACHMENTS[inv.id];
-      // Confirmed on every export, by design: attachments are session-only and
-      // this is the moment the user needs reminding of that.
+    var state = attachmentState(inv);
+
+    if (state === "local") {
+      // A pending selection that has not been stored yet. Resolve the bytes
+      // ONCE here and carry them down to the merge.
+      var pending = ATTACHMENTS[inv.id];
       showConfirmModal(
-        "PDF attachment included",
-        "This export will include the attached PDF: " + intended.name + ".\n\n" +
-        "The attachment is temporary and is not saved with the invoice. " +
-        "After a page refresh or new session, you will need to reattach it.",
-        "Continue & export",
-        function () { exportPDF(inv, intended); }
+        "PDF not saved yet",
+        "This export will include the selected PDF, but it has not been saved to the invoice yet.\n\n" +
+        "Save the invoice to store it permanently and make it available on other devices.",
+        "Export anyway",
+        function () {
+          exportPDF(inv, { bytes: pending.bytes, pageCount: pending.pageCount, name: pending.name });
+        }
       );
-    } else if (state === "stale") {
-      // Never export silently here — the user may well believe the old
-      // attachment is still going to be included.
-      showConfirmModal(
-        "Attachment no longer available",
-        "This invoice previously had a temporary PDF attachment.\n\n" +
-        "The file is no longer loaded. Reattach it if it should be included, " +
-        "or export the invoice without it.",
-        "Export without attachment",
-        // Explicit null: the user has just consented to an invoice-only export.
-        function () { exportPDF(inv, null); }
-      );
-    } else {
-      // No attachment and no marker — unchanged behavior.
-      exportPDF(inv, null);
+      return;
     }
+
+    if (state === "stored") {
+      // Fetch and decrypt server-side, then merge. The browser never sees the
+      // Sanity URL or the key — only the finished PDF bytes.
+      var expected = inv.attachment;
+      EXPORT_IN_FLIGHT = true;
+      fetch("/api/attachments?invoiceId=" + encodeURIComponent(inv.id))
+        .then(function (res) {
+          if (res.status === 401) {
+            EXPORT_IN_FLIGHT = false;
+            renderLogin("Your session expired. Please sign in again.");
+            return null;
+          }
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          return res.arrayBuffer();
+        })
+        .then(function (buf) {
+          if (!buf) return; // 401 already handled
+          EXPORT_IN_FLIGHT = false;
+          exportPDF(inv, {
+            bytes: new Uint8Array(buf),
+            pageCount: expected.pageCount,
+            name: null
+          });
+        })
+        .catch(function () {
+          EXPORT_IN_FLIGHT = false;
+          // Finance safety rule: never fall back to an invoice-only export when
+          // an attachment was expected.
+          showErrorModal("Export stopped — stored PDF unavailable",
+            "This invoice has a stored PDF attachment, but it could not be retrieved or decrypted. " +
+            "Nothing has been downloaded, so you will not send an invoice that is missing its attachment. " +
+            "Check your connection and try again.");
+        });
+      return;
+    }
+
+    // No attachment at all — unchanged behavior.
+    exportPDF(inv, null);
   }
 
   // ---- the single save gate ----
   //
   // Both Save Invoice buttons route through the one "save-invoice" action and
-  // land here. A *loaded* attachment warns that the PDF is not stored with the
-  // invoice; a stale marker alone does not, because the editor and archive
-  // warnings already cover that case.
+  // land here. With a pending PDF this becomes: upload -> save metadata ->
+  // only then delete the asset it replaced. With no pending PDF it is exactly
+  // the original save path.
   function requestSave() {
-    var inv = currentInvoice();
-    if (inv && attachmentState(inv.id) === "loaded") {
-      showConfirmModal(
-        "PDF attachment is temporary",
-        "The invoice will be saved to the archive, but the attached PDF will not be stored with it. " +
-        "The PDF is available only for this browser session.",
-        "Save Invoice",
-        doSaveInvoice
-      );
+    // Only one write to /api/state may be in flight from this browser at a
+    // time. Without this, a second Save (a double-click, or a click while the
+    // fire-and-forget persist() from "+ New Invoice" is still in flight) starts
+    // a second upload and a second PUT. persistRequest() captures STATE_VERSION
+    // at request time, so whichever PUT lands second carries a stale version and
+    // the server correctly rejects it — a 409 the app inflicted on itself, with
+    // no other user involved. Serialising writes here removes the false
+    // conflict without weakening the real optimistic-concurrency check: a
+    // genuine external save still returns 409 and is still honoured.
+    if (SAVING) {
+      scheduleToast("Save already in progress…");
       return;
     }
-    // No loaded attachment — exactly today's behavior, no extra confirmation.
-    doSaveInvoice();
+    var inv = currentInvoice();
+    if (!inv || !ATTACHMENTS[inv.id]) {
+      doSaveInvoice();
+      return;
+    }
+    saveWithPendingAttachment(inv);
   }
 
-  // The original Save Invoice logic, unchanged. Note it deliberately does not
-  // touch ATTACHMENTS: saving keeps the in-memory PDF, so attach -> save ->
-  // archive -> reopen -> export combined still works for the rest of the
-  // session. Attachment data is never added to the invoice object here, so the
-  // /api/state payload is byte-for-byte what it would be without this feature.
+  // Ordering is the whole point here:
+  //
+  //   upload new  ->  save new metadata  ->  delete the OLD asset
+  //
+  // A failure at any step must never destroy the previous working attachment,
+  // and must never leave the invoice claiming an attachment that isn't stored.
+  function saveWithPendingAttachment(inv) {
+    var pending = ATTACHMENTS[inv.id];
+    var previous = (inv.attachment && inv.attachment.assetId) ? inv.attachment : null;
+
+    SAVING = true;
+    scheduleToast(previous ? "Replacing stored PDF…" : "Storing PDF…");
+
+    uploadPendingAttachment(inv, pending)
+      .then(function (meta) {
+        // Uploaded. Point the invoice at it and try to save.
+        inv.attachment = meta;
+        inv.updatedAt = Date.now();
+
+        return persistRequest().then(function (result) {
+          if (result.ok) {
+            STATE_VERSION = result.body.version;
+            delete ATTACHMENTS[inv.id]; // bytes are stored now
+            SAVING = false;
+            hideConnBanner();
+            render();
+            scheduleToast("Invoice saved with attachment");
+            // Safe to drop the replaced asset only now that the new metadata
+            // is durably saved.
+            if (previous && previous.assetId !== meta.assetId) {
+              deleteStoredAsset(previous.assetId);
+            }
+            return;
+          }
+
+          // Save failed AFTER a successful upload. Roll back to the previous
+          // attachment and clean up the asset we just created.
+          inv.attachment = previous || undefined;
+          if (!previous) delete inv.attachment;
+          SAVING = false;
+          deleteStoredAsset(meta.assetId);
+
+          if (result.status === 401) {
+            renderLogin("Your session expired. Please sign in again.");
+            return;
+          }
+          if (result.status === 409) {
+            STATE = { invoices: result.body.invoices || [] };
+            STATE_VERSION = result.body.version;
+            render();
+            showErrorModal("Invoice not saved",
+              "Someone else saved changes while this invoice was being stored, so nothing was saved here. " +
+              "The newly uploaded PDF has been discarded and any previously stored PDF is untouched. " +
+              "Please re-apply your changes, attach the PDF again, and save.");
+            return;
+          }
+          render();
+          showErrorModal("Invoice not saved",
+            "The PDF was uploaded but the invoice could not be saved, so the upload has been discarded. " +
+            "Any previously stored PDF is untouched. Please try saving again.");
+        });
+      })
+      .catch(function (err) {
+        // Upload itself failed: the invoice is untouched, so it cannot be
+        // claiming an attachment that does not exist.
+        SAVING = false;
+        if (err && err.unauthorized) {
+          renderLogin("Your session expired. Please sign in again.");
+          return;
+        }
+        showErrorModal("PDF could not be stored",
+          describeUploadError(err) + "\n\n" +
+          "The invoice has not been saved and any previously stored PDF is untouched.");
+      });
+  }
+
+  function describeUploadError(err) {
+    var code = err && err.serverCode;
+    if (code === "TOO_LARGE") return "That PDF is larger than the " + formatBytes(MAX_ATTACHMENT_BYTES) + " limit.";
+    if (code === "ENCRYPTED_PDF") return "That PDF is password-protected or encrypted. Please supply an unprotected copy.";
+    if (code === "CORRUPT_PDF") return "That PDF could not be read by the server; it may be corrupt.";
+    if (code === "NOT_PDF") return "That file is not a PDF.";
+    if (code === "NO_PAGES") return "That PDF contains no pages.";
+    if (code === "storage_unavailable") return "Secure storage could not be reached.";
+    return "The PDF could not be stored.";
+  }
+
+  // The original Save Invoice logic, unchanged — used whenever there is no
+  // pending PDF to upload.
   function doSaveInvoice() {
     var inv = currentInvoice();
     if (inv) inv.updatedAt = Date.now();
@@ -1309,15 +1541,11 @@
             pageCount: pageCount,
             bytes: bytes
           };
-          // Timestamp-only marker, so a later refresh or reopen can still warn
-          // that this invoice had an attachment. No filename, no bytes.
-          // Reattaching refreshes the existing marker.
-          setMarker(inv.id);
         });
       })
       .then(function () {
         render();
-        scheduleToast("PDF attached for this session");
+        scheduleToast("PDF selected — Save Invoice to store it");
       })
       .catch(function (err) {
         showErrorModal("Could not attach this PDF", describeAttachError(err, file.name));
@@ -1401,7 +1629,8 @@
       .catch(function () {
         EXPORT_IN_FLIGHT = false;
         showErrorModal("Export stopped — attachment could not be merged",
-          '"' + att.name + '" could not be merged into this invoice. Nothing has been downloaded, ' +
+          (att.name ? '"' + att.name + '"' : "The attached PDF") +
+          " could not be merged into this invoice. Nothing has been downloaded, " +
           "so you will not send an invoice that is missing its attachment. " +
           "Try removing the attachment and adding it again.");
       });

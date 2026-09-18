@@ -14,8 +14,14 @@
  */
 
 const { readState, writeState } = require("../lib/db");
+const { requireSession, sendUnauthorized, isConfigured, sendNotConfigured } = require("../lib/auth");
 
 module.exports = async (req, res) => {
+  // The invoice archive is Finance data: every method here requires a valid
+  // session. Fails closed if auth itself is not configured.
+  if (!isConfigured()) return sendNotConfigured(res);
+  if (!requireSession(req)) return sendUnauthorized(res);
+
   if (req.method === "GET") {
     try {
       const state = await readState();
