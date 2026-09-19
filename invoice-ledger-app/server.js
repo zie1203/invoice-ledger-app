@@ -29,12 +29,38 @@ const fs = require("fs");
 loadDotEnvIfPresent();
 
 const { readState, writeState } = require("./lib/db");
+const {
+  handleAuthRequest, requireSession, sendUnauthorized, isConfigured, sendNotConfigured
+} = require("./lib/auth");
+const { handleAttachmentRequest } = require("./lib/attachment-api");
 
 const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+
+// Static assets stay public on purpose: index.html / app.js / styles.css carry
+// no secrets, and the login screen has to be able to load before a session
+// exists. Everything under /api is guarded below.
 app.use(express.static(path.join(__dirname, "public")));
+
+// /api/auth is the one endpoint reachable without a session — it is how a
+// session is established and checked. Registered BEFORE the guard below.
+app.all("/api/auth", (req, res) => { handleAuthRequest(req, res); });
+
+// Guard for every other /api/* route, including /api/state and
+// /api/attachments.
+app.use("/api", (req, res, next) => {
+  if (!isConfigured()) return sendNotConfigured(res);
+  if (!requireSession(req)) return sendUnauthorized(res);
+  next();
+});
+
+// Persistent encrypted attachments. Registered AFTER the guard above, so every
+// method here already has a verified session. express.json() ignores
+// application/octet-stream, so the raw upload stream reaches the handler
+// untouched and lib/attachment-api.js reads it directly.
+app.all("/api/attachments", (req, res) => { handleAttachmentRequest(req, res); });
 
 app.get("/api/state", async (req, res) => {
   try {
